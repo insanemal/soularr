@@ -609,8 +609,6 @@ def grab_most_wanted(albums):
             if os.path.exists(folder):
                 shutil.rmtree(folder)
 
-
-
         elif os.path.exists(folder):
             shutil.move(folder,artist_name_sanitized)
 
@@ -765,7 +763,13 @@ def get_records(missing: bool) -> list:
                 current_queue.extend(next_page['records'])
                 page += 1
 
-        queued_album_ids = [record['albumId'] for record in current_queue]
+        queued_album_ids = []
+        for record in current_queue:
+            if 'albumId' in record:
+                queued_album_ids.append(record['albumId'])
+            else:
+                logger.warning(f"Dropping entry due to missing key in keylist: [{record.keys()}]")
+        
         wanted_records_not_queued = []
         for record in wanted_records:
             for release in record['releases']:
