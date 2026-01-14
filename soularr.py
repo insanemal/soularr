@@ -643,9 +643,9 @@ def grab_most_wanted(albums):
     """
     This is the "main loop" that calls all the functions to do all the work.
     Basic flow per item is as follows:
-    Perform corse search
+    Perform coarse search
     Check search results for a match
-    enque download
+    enqueue download
     After that has happened for all the downloads it then shifts to monitoring the downloads:
     Monitor download and perform retries and/or requeues.
     When all completed, call lidarr to import
@@ -834,7 +834,7 @@ def grab_most_wanted(albums):
                     break
             else:  # Only runs if all files are successfully moved
                 os.rmdir(src_folder)
-                logger.info(f"Attemping Lidarr import of {done_albums[album_id]['artist']} - {done_albums[album_id]['title']}")
+                logger.info(f"Attempting Lidarr import of {done_albums[album_id]['artist']} - {done_albums[album_id]['title']}")
                 for file in done_albums[album_id]["files"]:
                     try:
                         song = music_tag.load_file(file["import_path"])
