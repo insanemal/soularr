@@ -291,6 +291,10 @@ def download_filter(allowed_filetype, directory):
 
 
 def check_for_match(tracks, allowed_filetype, file_dirs, username):
+    """
+    Does the actual match checking on a single disk/album.
+    """
+    logger.debug(f"Current broken users {broken_user}")
     if username in broken_user:
         return False, {}, ""
     for file_dir in file_dirs:
@@ -314,7 +318,8 @@ def check_for_match(tracks, allowed_filetype, file_dirs, username):
             except Exception:
                 logger.info(f'Error getting directory from user: "{username}"\n{traceback.format_exc()}')
                 broken_user.append(username)
-                continue
+                logger.debug(f"Updated broken users {broken_user}")
+                return False, {}, ""
             folder_cache[username][file_dir] = copy.deepcopy(directory)
         else:
             logger.info(f"User: {username} Folder: {file_dir} in cache. Using cached value")
@@ -341,6 +346,10 @@ def is_blacklisted(title: str) -> bool:
 
 
 def filter_list(albums):
+    """
+    Helper to do all the various filtering in one go and in one place. Same net effect as the previous multi-stage approach
+    Just neater and easier to work on.
+    """
     if enable_search_denylist:
         temp_list = []
         denylist = load_search_denylist(denylist_file_path)
@@ -370,7 +379,7 @@ def search_for_album(album):
     album_title = album["title"]
     artist_name = album["artist"]["artistName"]
     album_id = album["id"]
-    if len(album_title) == 1:
+    if len(album_title) == 1:  # Need to add some code to wrangle specific artist names in here.. ;)
         query = artist_name + " " + album_title
     else:
         query = artist_name + " " + album_title if config.getboolean("Search Settings", "album_prepend_artist", fallback=False) else album_title
@@ -389,11 +398,14 @@ def search_for_album(album):
 
     # Add timeout here to increase reliability with Slskd. Sometimes it doesn't update search status fast enough. More of an issue with lots of historical searches in slskd
     time.sleep(5)
-
+    start_time = time.time()
     while True:
         if slskd.searches.state(search["id"], False)["state"] != "InProgress":  # Added False here as we don't want the search results here. Just the state.
             break
         time.sleep(1)
+        if (time.time() - start_time) > config.getint("Search Settings", "search_timeout", fallback=5000):
+            logger.error("Failed to perform search via SLSKD due to timeout on search results.")
+            return False
 
     search_results = slskd.searches.search_responses(search["id"])  # We use this API call twice. Let's just cache it locally.
     logger.info(f"Search returned {len(search_results)} results")
@@ -426,6 +438,10 @@ def search_for_album(album):
 
 
 def slskd_do_enqueue(username, files, file_dir):
+    """
+    Takes a list of files to download and returns a list of files that were successfully added to the download queue
+    It also adds to each file the details needed to track that specific file.
+    """
     downloads = []
     try:
         enqueue = slskd.transfers.enqueue(username=username, files=files)
@@ -452,6 +468,9 @@ def slskd_do_enqueue(username, files, file_dir):
 
 
 def slskd_download_status(downloads):
+    """
+    Takes a list of files and gets the status of each file and packs it into the file object.
+    """
     ok = True
     for file in downloads:
         try:
@@ -466,12 +485,15 @@ def slskd_download_status(downloads):
 
 
 def downloads_all_done(downloads):
+    """
+    Checks the status of all the files in an album and returns a flag if all done as well
+    as returning a list of files with errors to check and how many files are in "Queued, Remotely"
+    """
     all_done = True
     error_list = []
     remote_queue = 0
     for file in downloads:
         if file["status"] is not None:
-            # print(f"Filename: {file['filename']} is currently {file['status']['state']}")
             if not file["status"]["state"] == "Completed, Succeeded":
                 all_done = False
             if file["status"]["state"] in [
@@ -489,6 +511,10 @@ def downloads_all_done(downloads):
 
 
 def try_enqueue(all_tracks, results, allowed_filetype):
+    """
+    Single album match and enqueue.
+    Iterates over all users and enqueues a found match
+    """
     for username in results:
         if allowed_filetype not in results[username]:
             continue
@@ -523,6 +549,11 @@ def try_enqueue(all_tracks, results, allowed_filetype):
 
 
 def try_multi_enqueue(release, all_tracks, results, allowed_filetype):
+    """
+    This is the multi-disk/media path for locating and enqueueing an album
+    It does a flat search first. Then it does a split search.
+    Otherwise it's basically the same as the single album search.
+    """
     split_release = []
     tmp_results = copy.deepcopy(results)
     for media in release["media"]:
@@ -601,6 +632,11 @@ def try_multi_enqueue(release, all_tracks, results, allowed_filetype):
 
 
 def find_download(album, grab_list):
+    """
+    This does the main loop over search results and user directories
+    It has two paths it can take. One is the "single album" path
+    The other is the multi-media path.
+    """
     album_id = album["id"]
     artist_name = album["artist"]["artistName"]
     artist_id = album["artistId"]
@@ -691,22 +727,23 @@ def grab_most_wanted(albums):
         done_count = 0
         for album_id in list(grab_list.keys()):
             if slskd_download_status(grab_list[album_id]["files"]):
-                album_done, problems, queued = downloads_all_done(grab_list[album_id]["files"])
+                album_done, problems, queued = downloads_all_done(grab_list[album_id]["files"])  # Lets check to see what status the files have
                 if "count_start" not in grab_list[album_id]:
                     grab_list[album_id]["count_start"] = time.time()
-                if (time.time() - grab_list[album_id]["count_start"]) >= stalled_timeout:
+                if (time.time() - grab_list[album_id]["count_start"]) >= stalled_timeout:  # Album is taking too long. Bail out regardless
                     delete_album("Timeout waiting for download of")
-                if queued == len(grab_list[album_id]["files"]):
+                    continue
+                if queued == len(grab_list[album_id]["files"]):  # Shorter time out for whole albums in "Queued, Remotely"
                     if (time.time() - grab_list[album_id]["count_start"]) >= remote_queue_timeout:
                         delete_album("Timeout waiting for download of")
                         continue
                 done_count += album_done
                 if problems is not None:
-                    print("We got problems!")
+                    logger.debug("We got problems!")
                     for file in problems:
-                        print(f"Checking {file['filename']}")
+                        logger.debug(f"Checking {file['filename']}")
                         match file["status"]["state"]:
-                            case "Completed, Cancelled" | "Completed, TimedOut" | "Completed, Errored":
+                            case "Completed, Cancelled" | "Completed, TimedOut" | "Completed, Errored":  # Normal errors. We'll retry a few times as sometumes the error is transient
                                 abort = False
                                 if len(problems) == len(grab_list[album_id]["files"]):
                                     delete_album("Failed grab of")
@@ -730,22 +767,28 @@ def grab_most_wanted(albums):
                                                 download_file["id"] = requeue[0]["id"]
                                                 download_file["retry"] = retry
                                                 time.sleep(1)
-                                                _ = slskd_download_status(grab_list[album_id]["files"])
+                                                _ = slskd_download_status(grab_list[album_id]["files"])  # Refresh the status of the files to prevent issues.
                                             else:
                                                 delete_album("Failed grab of")
-                                                abort = True
+                                                abort = True  # Move to the next album so we don't block or overload a remote user
                                                 break
                                         else:
                                             # Delete from album list add to failures
                                             delete_album("Failed grab of")
-                                            abort = True
+                                            abort = True  # As above.
                                             break
                                 if abort:
                                     break
                             case "Completed, Rejected":
                                 # Do a measured retry. This is often a soft failure due to grab limits. Check if any files worked then go from there.
+                                # This needs a recode. But it works for now.
+                                # In the recode we need to test to see if we are getting multiple albums from the same user and temper our retries based on
+                                # those other album(s) completing.
+                                # If we aren't in that condition we need to fall back to per file retry counts as files will also be rejected if the file is
+                                # too long or too short based on the share record. This can happen when people re-tag media but don't rescan media.
+                                # Also I've seen cases of single files out of a set being in the "not shared" catagory.
                                 if len(problems) == len(grab_list[album_id]["files"]):
-                                    delete_album("Failed grab of")
+                                    delete_album("Failed grab of")  # They are all rejected. Usually this happens because of misconfigurations. Files appear in search but aren't shared.
                                     break
                                 else:
                                     if "rejected_retries" not in grab_list[album_id]:
@@ -755,7 +798,7 @@ def grab_most_wanted(albums):
                                         if gfile["status"]["state"] in ["Completed, Succeeded", "Queued, Remotely", "Queued, Locally"]:
                                             working_count -= 1
                                     if working_count == 0:
-                                        if grab_list[album_id]["rejected_retries"] < int(len(grab_list[album_id]["files"]) * 1.5):
+                                        if grab_list[album_id]["rejected_retries"] < int(len(grab_list[album_id]["files"]) * 1.2):  # Little bit of wiggle room here
                                             abort = False
                                             for gfile in grab_list[album_id]["files"]:
                                                 if gfile["filename"] == file["filename"]:
@@ -791,7 +834,9 @@ def grab_most_wanted(albums):
                                             delete_album("Failed grab of")
                                             break
                             case _:
-                                logger.error("Not sure how I got here. This shouldn't be possible for problem files!")
+                                logger.error(
+                                    "Not sure how I got here. This shouldn't be possible for problem files!"
+                                )  # This really should be impossible to reach. But is required to round out the case statement.
                 else:
                     if album_done:
                         done_albums[album_id] = grab_list[album_id]
@@ -802,27 +847,31 @@ def grab_most_wanted(albums):
                 if "error_count" not in grab_list[album_id]:
                     grab_list[album_id]["error_count"] = 0
                 grab_list[album_id]["error_count"] += 1
-            # I dunno. slskd might be broken? Or the user deleted things?
+            # I dunno. slskd might be broken? Or the user deleted things? I've never seen this so I have no idea what we should do here. It most likely would mean SLSKD is down.
+            # So we probably want to abort everything because cleanup would be impossible.
 
-        if len(grab_list) < 1:
+        if len(grab_list) < 1:  # We remove items from the grab list once they are downloaded or aborted. So when there are no grabs left, we are done!
             break
 
-        time.sleep(5)
+        time.sleep(5)  # Wait for things to progress and start the checks again.
 
     if len(done_albums) > 0:
         commands = []
-        for album_id in done_albums:
+        for album_id in done_albums:  # Loop through the albums. Move them into folders with the nameing structure as follows: Artist - Album Title (year) This triggers better import logic
             os.chdir(slskd_download_dir)
             import_folder_name = sanitize_folder_name(done_albums[album_id]["artist"] + " - " + done_albums[album_id]["title"] + " (" + done_albums[album_id]["year"] + ")")
             import_folder_fullpath = os.path.join(slskd_download_dir, import_folder_name)
             lidarr_import_fullpath = os.path.join(lidarr_download_dir, import_folder_name)
             done_albums[album_id]["import_folder"] = lidarr_import_fullpath
+            rm_dirs = []
             if not os.path.exists(import_folder_fullpath):
                 os.mkdir(import_folder_fullpath)
             for file in done_albums[album_id]["files"]:
                 file_folder = file["file_dir"].split("\\")[-1]
                 filename = file["filename"].split("\\")[-1]
                 src_folder = os.path.join(slskd_download_dir, file_folder)
+                if src_folder not in rm_dirs:
+                    rm_dirs.append(src_folder)  # Multi disk albums are sometimes in multiple folders. eg. CD01 CD02. So we need to clean up both
                 src_file = os.path.join(src_folder, filename)
                 dst_file = os.path.join(import_folder_fullpath, filename)
                 file["import_path"] = dst_file
@@ -833,10 +882,12 @@ def grab_most_wanted(albums):
                     logger.error(e)
                     break
             else:  # Only runs if all files are successfully moved
-                os.rmdir(src_folder)
-                logger.info(f"Attempting Lidarr import of {done_albums[album_id]['artist']} - {done_albums[album_id]['title']}")
+                for rm_dir in rm_dirs:
+                    if not rm_dir == import_folder_fullpath:
+                        os.rmdir(rm_dir)
+                logger.info(f"Attemping Lidarr import of {done_albums[album_id]['artist']} - {done_albums[album_id]['title']}")
                 for file in done_albums[album_id]["files"]:
-                    try:
+                    try:  # This sometimes fails. No idea why. Nor do we care. We try and that's what matters
                         song = music_tag.load_file(file["import_path"])
                         if "disk_no" in file:
                             song["discnumber"] = file["disk_no"]
@@ -850,8 +901,8 @@ def grab_most_wanted(albums):
                 command = lidarr.post_command(
                     name="DownloadedAlbumsScan",
                     path=done_albums[album_id]["import_folder"],
-                )
-                done_albums[album_id]["lidarr_id"] = command["id"]
+                )  # Album all tagged up and in a correctly named folder. This should work more reliably
+                done_albums[album_id]["lidarr_id"] = command["id"]  # This is just for the info message
                 commands.append(command)
                 logger.info(f"Starting Lidarr import for: {done_albums[album_id]['title']} ID: {command['id']}")
         while True:
