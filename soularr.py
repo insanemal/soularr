@@ -786,7 +786,7 @@ def grab_most_wanted(albums):
                                 # those other album(s) completing.
                                 # If we aren't in that condition we need to fall back to per file retry counts as files will also be rejected if the file is
                                 # too long or too short based on the share record. This can happen when people re-tag media but don't rescan media.
-                                # Also I've seen cases of single files out of a set being in the "not shared" catagory.
+                                # Also I've seen cases of single files out of a set being in the "not shared" category.
                                 if len(problems) == len(grab_list[album_id]["files"]):
                                     delete_album("Failed grab of")  # They are all rejected. Usually this happens because of misconfigurations. Files appear in search but aren't shared.
                                     break
@@ -857,7 +857,7 @@ def grab_most_wanted(albums):
 
     if len(done_albums) > 0:
         commands = []
-        for album_id in done_albums:  # Loop through the albums. Move them into folders with the nameing structure as follows: Artist - Album Title (year) This triggers better import logic
+        for album_id in done_albums:  # Loop through the albums. Move them into folders with the naming structure as follows: Artist - Album Title (year) This triggers better import logic
             os.chdir(slskd_download_dir)
             import_folder_name = sanitize_folder_name(done_albums[album_id]["artist"] + " - " + done_albums[album_id]["title"] + " (" + done_albums[album_id]["year"] + ")")
             import_folder_fullpath = os.path.join(slskd_download_dir, import_folder_name)
@@ -885,7 +885,7 @@ def grab_most_wanted(albums):
                 for rm_dir in rm_dirs:
                     if not rm_dir == import_folder_fullpath:
                         os.rmdir(rm_dir)
-                logger.info(f"Attemping Lidarr import of {done_albums[album_id]['artist']} - {done_albums[album_id]['title']}")
+                logger.info(f"Attempting Lidarr import of {done_albums[album_id]['artist']} - {done_albums[album_id]['title']}")
                 for file in done_albums[album_id]["files"]:
                     try:  # This sometimes fails. No idea why. Nor do we care. We try and that's what matters
                         song = music_tag.load_file(file["import_path"])
