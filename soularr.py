@@ -561,6 +561,7 @@ def downloads_all_done(downloads):
                 "Completed, TimedOut",
                 "Completed, Errored",
                 "Completed, Rejected",
+                "Completed, Aborted",
             ]:
                 error_list.append(file)
             if file["status"]["state"] == "Queued, Remotely":
@@ -766,6 +767,8 @@ def process_completed_album(album_data, failed_grab):
         if src_folder not in rm_dirs:
             rm_dirs.append(src_folder)  # Multi disk albums are sometimes in multiple folders. eg. CD01 CD02. So we need to clean up both
         src_file = os.path.join(src_folder, filename)
+        if "disk_no" in file and "disk_count" in file and file["disk_count"] > 1:
+            filename = f"Disk {file['disk_no']} - {filename}"
         dst_file = os.path.join(import_folder_fullpath, filename)
         file["import_path"] = dst_file
         try:
@@ -840,6 +843,7 @@ def monitor_downloads(grab_list, failed_grab):
         #    "Completed, Cancelled", Abort album as failed
         #    "Completed, TimedOut",  Abort album as failed
         #    "Completed, Errored",   Abort album as failed
+        #    "Completed, Aborted",   Abort album as failed
         #    "Completed, Rejected",  Retry. Some users have a max grab count. We need to check if ALL files are Rejected first.
         # We're going to need to drop items out of the list. So we might have to resort to enumerating the keys so we don't hit issues.
         done_count = 0
