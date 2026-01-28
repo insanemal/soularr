@@ -223,6 +223,8 @@ number_of_albums_to_grab = 10
 remove_wanted_on_failure = False
 # Blacklist words in album or track titles (case-insensitive)
 title_blacklist = Word1,word2
+# Blacklist words in search query (case-insensitive)
+search_blacklist = WordToStripFromSearch1,WordToStripFromSearch2
 # Lidarr search source: "missing" or "cutoff_unmet"
 search_source = missing
 # Enable search denylist to skip albums that repeatedly fail

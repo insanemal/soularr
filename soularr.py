@@ -80,6 +80,7 @@ config_file_path = None
 failure_file_path = None
 current_page_file_path = None
 denylist_file_path = None
+search_blacklist = []
 
 # === Runtime State & Caches ===
 search_cache = {}
@@ -428,6 +429,20 @@ def search_for_album(album):
         query = artist_name + " " + album_title
     else:
         query = artist_name + " " + album_title if config.getboolean("Search Settings", "album_prepend_artist", fallback=False) else album_title
+
+    original_query = query
+    for word in search_blacklist:
+        if word:
+            # Case-insensitive replacement
+            pattern = re.compile(re.escape(word), re.IGNORECASE)
+            query = pattern.sub("", query)
+
+    # Clean up double spaces
+    query = " ".join(query.split())
+
+    if query != original_query:
+        logger.info(f"Filtered search query: '{original_query}' -> '{query}'")
+
     logger.info(f"Searching for album: {query}")
     try:
         search = slskd.searches.search_text(
@@ -734,9 +749,85 @@ def search_and_queue(albums):
     return grab_list, failed_search, failed_grab
 
 
-def monitor_downloads(grab_list, failed_grab):
-    done_albums = {}
+def process_completed_album(album_data, failed_grab):
+    os.chdir(slskd_download_dir)
+    import_folder_name = sanitize_folder_name(album_data["artist"] + " - " + album_data["title"] + " (" + album_data["year"] + ")")
+    import_folder_fullpath = os.path.join(slskd_download_dir, import_folder_name)
+    lidarr_import_fullpath = os.path.join(lidarr_download_dir, import_folder_name)
+    album_data["import_folder"] = lidarr_import_fullpath
+    rm_dirs = []
+    moved_files_history = []
+    if not os.path.exists(import_folder_fullpath):
+        os.mkdir(import_folder_fullpath)
+    for file in album_data["files"]:
+        file_folder = file["file_dir"].split("\\")[-1]
+        filename = file["filename"].split("\\")[-1]
+        src_folder = os.path.join(slskd_download_dir, file_folder)
+        if src_folder not in rm_dirs:
+            rm_dirs.append(src_folder)  # Multi disk albums are sometimes in multiple folders. eg. CD01 CD02. So we need to clean up both
+        src_file = os.path.join(src_folder, filename)
+        dst_file = os.path.join(import_folder_fullpath, filename)
+        file["import_path"] = dst_file
+        try:
+            shutil.move(src_file, dst_file)
+            moved_files_history.append((src_file, dst_file))
+        except Exception:
+            logger.exception(f"Failed to move: {file['filename']} to temp location for import into Lidarr. Rolling back...")
+            for src, dst in reversed(moved_files_history):
+                try:
+                    shutil.move(dst, src)
+                except Exception:
+                    logger.exception(f"Critical failure during rollback: could not move {dst} back to {src}")
+            try:
+                os.rmdir(import_folder_fullpath)
+            except OSError:
+                logger.warning(f"Could not remove temp import directory {import_folder_fullpath}")
+            failed_grab.append(lidarr.get_album(album_data["album_id"]))
+            return
+    else:  # Only runs if all files are successfully moved
+        for rm_dir in rm_dirs:
+            if not rm_dir == import_folder_fullpath:
+                try:
+                    os.rmdir(rm_dir)
+                except OSError:
+                    logger.warning(f"Skipping removal of {rm_dir} because it's not empty.")
+        logger.info(f"Attempting Lidarr import of {album_data['artist']} - {album_data['title']}")
+        for file in album_data["files"]:
+            try:  # This sometimes fails. No idea why. Nor do we care. We try and that's what matters
+                song = music_tag.load_file(file["import_path"])
+                if "disk_no" in file:
+                    song["discnumber"] = file["disk_no"]
+                    song["totaldiscs"] = file["disk_count"]
 
+                song["albumartist"] = album_data["artist"]
+                song["album"] = album_data["title"]
+                song.save()
+            except Exception:
+                logger.exception("Error writing tags")
+        command = lidarr.post_command(
+            name="DownloadedAlbumsScan",
+            path=album_data["import_folder"],
+        )  # Album all tagged up and in a correctly named folder. This should work more reliably
+        logger.info(f"Starting Lidarr import for: {album_data['title']} ID: {command['id']}")
+
+        while True:
+            current_task = lidarr.get_command(command["id"])
+            if current_task["status"] == "completed" or current_task["status"] == "failed":
+                break
+            time.sleep(2)
+
+        try:
+            logger.info(f"{current_task['commandName']} {current_task['message']} from: {current_task['body']['path']}")
+
+            if "Failed" in current_task["message"]:
+                move_failed_import(current_task["body"]["path"])
+                failed_grab.append(lidarr.get_album(album_data["album_id"]))
+        except Exception:
+            logger.exception("Error printing lidarr task message")
+            logger.error(current_task)
+
+
+def monitor_downloads(grab_list, failed_grab):
     def delete_album(reason):
         cancel_and_delete(grab_list[album_id]["files"])
         logger.info(f"{reason} Album: {grab_list[album_id]['title']} Artist: {grab_list[album_id]['artist']}")
@@ -770,7 +861,9 @@ def monitor_downloads(grab_list, failed_grab):
                     for file in problems:
                         logger.debug(f"Checking {file['filename']}")
                         match file["status"]["state"]:
-                            case "Completed, Cancelled" | "Completed, TimedOut" | "Completed, Errored":  # Normal errors. We'll retry a few times as sometumes the error is transient
+                            case (
+                                "Completed, Cancelled" | "Completed, TimedOut" | "Completed, Errored" | "Completed, Aborted"
+                            ):  # Normal errors. We'll retry a few times as sometumes the error is transient
                                 abort = False
                                 if len(problems) == len(grab_list[album_id]["files"]):
                                     delete_album("Failed grab of")
@@ -822,7 +915,11 @@ def monitor_downloads(grab_list, failed_grab):
                                         grab_list[album_id]["rejected_retries"] = 0
                                     working_count = len(grab_list[album_id]["files"]) - len(problems)
                                     for gfile in grab_list[album_id]["files"]:
-                                        if gfile["status"]["state"] in ["Completed, Succeeded", "Queued, Remotely", "Queued, Locally"]:
+                                        if gfile["status"]["state"] in [
+                                            "Completed, Succeeded",
+                                            "Queued, Remotely",
+                                            "Queued, Locally",
+                                        ]:
                                             working_count -= 1
                                     if working_count == 0:
                                         if grab_list[album_id]["rejected_retries"] < int(len(grab_list[album_id]["files"]) * 1.2):  # Little bit of wiggle room here
@@ -866,9 +963,11 @@ def monitor_downloads(grab_list, failed_grab):
                                 )  # This really should be impossible to reach. But is required to round out the case statement.
                 else:
                     if album_done:
-                        done_albums[album_id] = grab_list[album_id]
+                        album_data = grab_list[album_id]
+                        album_data["album_id"] = album_id
+                        logger.info(f"Completed download of Album: {album_data['title']} Artist: {album_data['artist']}")
+                        process_completed_album(album_data, failed_grab)
                         del grab_list[album_id]
-                        logger.info(f"Completed download of Album: {done_albums[album_id]['title']} Artist: {done_albums[album_id]['artist']}")
 
             else:
                 if "error_count" not in grab_list[album_id]:
@@ -881,7 +980,6 @@ def monitor_downloads(grab_list, failed_grab):
             break
 
         time.sleep(5)  # Wait for things to progress and start the checks again.
-    return done_albums
 
 
 def grab_most_wanted(albums):
@@ -909,83 +1007,7 @@ def grab_most_wanted(albums):
     logger.info("-------------------")
     logger.info(f"Waiting for downloads... monitor at: {''.join([slskd_host_url, slskd_url_base, 'downloads'])}")
 
-    done_albums = monitor_downloads(grab_list, failed_grab)
-
-    if len(done_albums) > 0:
-        commands = []
-        for album_id in done_albums:  # Loop through the albums. Move them into folders with the naming structure as follows: Artist - Album Title (year) This triggers better import logic
-            os.chdir(slskd_download_dir)
-            import_folder_name = sanitize_folder_name(done_albums[album_id]["artist"] + " - " + done_albums[album_id]["title"] + " (" + done_albums[album_id]["year"] + ")")
-            import_folder_fullpath = os.path.join(slskd_download_dir, import_folder_name)
-            lidarr_import_fullpath = os.path.join(lidarr_download_dir, import_folder_name)
-            done_albums[album_id]["import_folder"] = lidarr_import_fullpath
-            rm_dirs = []
-            if not os.path.exists(import_folder_fullpath):
-                os.mkdir(import_folder_fullpath)
-            for file in done_albums[album_id]["files"]:
-                file_folder = file["file_dir"].split("\\")[-1]
-                filename = file["filename"].split("\\")[-1]
-                src_folder = os.path.join(slskd_download_dir, file_folder)
-                if src_folder not in rm_dirs:
-                    rm_dirs.append(src_folder)  # Multi disk albums are sometimes in multiple folders. eg. CD01 CD02. So we need to clean up both
-                src_file = os.path.join(src_folder, filename)
-                dst_file = os.path.join(import_folder_fullpath, filename)
-                file["import_path"] = dst_file
-                try:
-                    shutil.move(src_file, dst_file)
-                except Exception:
-                    logger.exception(f"Failed to move: {file['filename']} to temp location for import into Lidarr.")
-                    break
-            else:  # Only runs if all files are successfully moved
-                for rm_dir in rm_dirs:
-                    if not rm_dir == import_folder_fullpath:
-                        try:
-                            os.rmdir(rm_dir)
-                        except OSError:
-                            logger.warning(f"Skipping removal of {rm_dir} because it's not empty.")
-                logger.info(f"Attempting Lidarr import of {done_albums[album_id]['artist']} - {done_albums[album_id]['title']}")
-                for file in done_albums[album_id]["files"]:
-                    try:  # This sometimes fails. No idea why. Nor do we care. We try and that's what matters
-                        song = music_tag.load_file(file["import_path"])
-                        if "disk_no" in file:
-                            song["discnumber"] = file["disk_no"]
-                            song["totaldiscs"] = file["disk_count"]
-
-                        song["albumartist"] = done_albums[album_id]["artist"]
-                        song["album"] = done_albums[album_id]["title"]
-                        song.save()
-                    except Exception:
-                        logger.exception("Error writing tags")
-                command = lidarr.post_command(
-                    name="DownloadedAlbumsScan",
-                    path=done_albums[album_id]["import_folder"],
-                )  # Album all tagged up and in a correctly named folder. This should work more reliably
-                done_albums[album_id]["lidarr_id"] = command["id"]  # This is just for the info message
-                commands.append(command)
-                logger.info(f"Starting Lidarr import for: {done_albums[album_id]['title']} ID: {command['id']}")
-        while True:
-            completed_count = 0
-            for task in commands:
-                current_task = lidarr.get_command(task["id"])
-                if current_task["status"] == "completed" or current_task["status"] == "failed":
-                    completed_count += 1
-            if completed_count == len(commands):
-                break
-            time.sleep(2)
-
-        for task in commands:
-            current_task = lidarr.get_command(task["id"])
-            try:
-                logger.info(f"{current_task['commandName']} {current_task['message']} from: {current_task['body']['path']}")
-
-                if "Failed" in current_task["message"]:
-                    move_failed_import(current_task["body"]["path"])
-                    for album_id in done_albums:
-                        if done_albums[album_id]["lidarr_id"] == task["id"]:
-                            failed_grab.append(lidarr.get_album(album_id))
-            except Exception:
-                logger.exception("Error printing lidarr task message")
-                logger.error(current_task)
+    monitor_downloads(grab_list, failed_grab)
 
     count = len(failed_search) + len(failed_grab)
     for album in failed_search:
@@ -1244,6 +1266,7 @@ def main():
         failure_file_path, \
         current_page_file_path, \
         denylist_file_path, \
+        search_blacklist, \
         lidarr, \
         slskd, \
         config, \
@@ -1344,6 +1367,8 @@ def main():
         slskd_url_base = config.get("Slskd", "url_base", fallback="/")
 
         ignored_users = config.get("Search Settings", "ignored_users", fallback="").split(",")
+        search_blacklist = config.get("Search Settings", "search_blacklist", fallback="").split(",")
+        search_blacklist = [word.strip() for word in search_blacklist if word.strip()]
         search_type = config.get("Search Settings", "search_type", fallback="first_page").lower().strip()
         search_source = config.get("Search Settings", "search_source", fallback="missing").lower().strip()
 
