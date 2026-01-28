@@ -9,7 +9,6 @@ import time
 import shutil
 import difflib
 import operator
-import traceback
 import configparser
 import logging
 import json
@@ -362,7 +361,7 @@ def check_for_match(tracks, allowed_filetype, file_dirs, username):
                 else:
                     directory = slskd.users.directory(username=username, directory=file_dir)
             except Exception:
-                logger.info(f'Error getting directory from user: "{username}"\n{traceback.format_exc()}')
+                logger.exception(f'Error getting directory from user: "{username}"')
                 broken_user.append(username)
                 logger.debug(f"Updated broken users {broken_user}")
                 return False, {}, ""
@@ -439,7 +438,7 @@ def search_for_album(album):
             minimumPeerUploadSpeed=config.getint("Search Settings", "minimum_peer_upload_speed", fallback=0),
         )
     except Exception:
-        logger.error(f"Failed to perform search via SLSKD: {query}\n{traceback.format_exc()}")
+        logger.exception(f"Failed to perform search via SLSKD: {query}")
         return False
 
     # Add timeout here to increase reliability with Slskd. Sometimes it doesn't update search status fast enough. More of an issue with lots of historical searches in slskd
@@ -491,7 +490,8 @@ def slskd_do_enqueue(username, files, file_dir):
     downloads = []
     try:
         enqueue = slskd.transfers.enqueue(username=username, files=files)
-    except:
+    except Exception:
+        logger.debug("Enqueue failed", exc_info=True)
         return None
     if enqueue:
         time.sleep(5)
@@ -522,9 +522,8 @@ def slskd_download_status(downloads):
         try:
             status = slskd.transfers.get_download(file["username"], file["id"])
             file["status"] = status
-        except Exception as e:
-            logger.error(f"Error getting download status of {file['filename']}. Traceback to follow:")
-            logger.info(e)
+        except Exception:
+            logger.exception(f"Error getting download status of {file['filename']}")
             file["status"] = None
             ok = False
     return ok
@@ -654,12 +653,12 @@ def try_multi_enqueue(release, all_tracks, results, allowed_filetype):
                     if len(all_downloads) > 0:
                         cancel_and_delete(all_downloads)
                         return False, None
-            except Exception as e:
+            except Exception:
                 album = lidarr.get_album(all_tracks[0]["albumId"])
                 album_name = album["title"]
                 artist_name = album["artist"]["artistName"]
 
-                logger.warning(f"Exception enqueueing tracks: {e}")
+                logger.exception("Exception enqueueing tracks")
                 logger.info(f"Exception enqueueing download to slskd for {artist_name} - {album_name} from {username}")
                 # Delete all other downloads in all_downloads list
                 if len(all_downloads) > 0:
@@ -721,18 +720,7 @@ def find_download(album, grab_list):
     return False
 
 
-def grab_most_wanted(albums):
-    """
-    This is the "main loop" that calls all the functions to do all the work.
-    Basic flow per item is as follows:
-    Perform coarse search
-    Check search results for a match
-    enqueue download
-    After that has happened for all the downloads it then shifts to monitoring the downloads:
-    Monitor download and perform retries and/or requeues.
-    When all completed, call lidarr to import
-    """
-
+def search_and_queue(albums):
     grab_list = {}
     failed_grab = []
     failed_search = []
@@ -743,17 +731,10 @@ def grab_most_wanted(albums):
 
         else:
             failed_search.append(album)
-    total_albums = len(grab_list)
-    logger.info(f"Total Downloads added: {total_albums}")
-    for album_id in grab_list:
-        logger.info(f"Album: {grab_list[album_id]['title']} Artist: {grab_list[album_id]['artist']}")
-    logger.info(f"Failed to grab: {len(failed_grab)}")
-    for album in failed_grab:
-        logger.info(f"Album: {album['title']} Artist: {album['artist']['artistName']}")
+    return grab_list, failed_search, failed_grab
 
-    logger.info("-------------------")
-    logger.info(f"Waiting for downloads... monitor at: {''.join([slskd_host_url, slskd_url_base, 'downloads'])}")
 
+def monitor_downloads(grab_list, failed_grab):
     done_albums = {}
 
     def delete_album(reason):
@@ -900,6 +881,35 @@ def grab_most_wanted(albums):
             break
 
         time.sleep(5)  # Wait for things to progress and start the checks again.
+    return done_albums
+
+
+def grab_most_wanted(albums):
+    """
+    This is the "main loop" that calls all the functions to do all the work.
+    Basic flow per item is as follows:
+    Perform coarse search
+    Check search results for a match
+    enqueue download
+    After that has happened for all the downloads it then shifts to monitoring the downloads:
+    Monitor download and perform retries and/or requeues.
+    When all completed, call lidarr to import
+    """
+
+    grab_list, failed_search, failed_grab = search_and_queue(albums)
+
+    total_albums = len(grab_list)
+    logger.info(f"Total Downloads added: {total_albums}")
+    for album_id in grab_list:
+        logger.info(f"Album: {grab_list[album_id]['title']} Artist: {grab_list[album_id]['artist']}")
+    logger.info(f"Failed to grab: {len(failed_grab)}")
+    for album in failed_grab:
+        logger.info(f"Album: {album['title']} Artist: {album['artist']['artistName']}")
+
+    logger.info("-------------------")
+    logger.info(f"Waiting for downloads... monitor at: {''.join([slskd_host_url, slskd_url_base, 'downloads'])}")
+
+    done_albums = monitor_downloads(grab_list, failed_grab)
 
     if len(done_albums) > 0:
         commands = []
@@ -923,9 +933,8 @@ def grab_most_wanted(albums):
                 file["import_path"] = dst_file
                 try:
                     shutil.move(src_file, dst_file)
-                except Exception as e:
-                    logger.error(f"Failed to move: {file['filename']} to temp location for import into Lidarr. Full error message:")
-                    logger.error(e)
+                except Exception:
+                    logger.exception(f"Failed to move: {file['filename']} to temp location for import into Lidarr.")
                     break
             else:  # Only runs if all files are successfully moved
                 for rm_dir in rm_dirs:
@@ -945,8 +954,8 @@ def grab_most_wanted(albums):
                         song["albumartist"] = done_albums[album_id]["artist"]
                         song["album"] = done_albums[album_id]["title"]
                         song.save()
-                    except:
-                        logger.error("Error writing tags")
+                    except Exception:
+                        logger.exception("Error writing tags")
                 command = lidarr.post_command(
                     name="DownloadedAlbumsScan",
                     path=done_albums[album_id]["import_folder"],
@@ -974,8 +983,8 @@ def grab_most_wanted(albums):
                     for album_id in done_albums:
                         if done_albums[album_id]["lidarr_id"] == task["id"]:
                             failed_grab.append(lidarr.get_album(album_id))
-            except:
-                logger.error("Error printing lidarr task message. Printing full unparsed message.")
+            except Exception:
+                logger.exception("Error printing lidarr task message")
                 logger.error(current_task)
 
     count = len(failed_search) + len(failed_grab)
@@ -1397,8 +1406,7 @@ def main():
                     failed = 0
                     logger.info("No releases wanted that aren't on the deny list and/or blacklisted")
             except Exception:
-                logger.error(traceback.format_exc())
-                logger.error("\n Fatal error! Exiting...")
+                logger.exception("Fatal error! Exiting...")
 
                 if os.path.exists(lock_file_path) and not is_docker():
                     os.remove(lock_file_path)
